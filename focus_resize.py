@@ -60,6 +60,12 @@ def frame_key(frame):
     return (frame.origin.x, frame.origin.y, frame.size.width, frame.size.height)
 
 
+def frame_from_key(key):
+    x, y, width, height = key
+    return iterm2.util.Frame(
+        iterm2.util.Point(x, y), iterm2.util.Size(width, height))
+
+
 def is_splitter(node):
     return hasattr(node, "children")
 
@@ -150,11 +156,22 @@ async def resize_around(window, tab, focused_session_id, anchors):
     assign(tab.root, total[0], total[1], focused_session_id)
     await tab.async_update_layout()
 
-    # Record the frame this reflow produced, so the next one can tell a window
-    # the user resized from a window iTerm2 rounded down to fit the request.
-    settled = (frame_key(await window.async_get_frame()), len(panes))
-    anchors[tab.tab_id] = (settled, total)
-    log("  used={} ({}) -> frame={}".format(total, why, settled[0]))
+    # Asking for the cells a tab already had does not reliably reproduce the
+    # window it had them in: dividers, per-pane margins and a scrollbar all take
+    # room that measuring the panes cannot see, and they differ between a tab
+    # with one pane and a tab with four. Rather than try to price each of them,
+    # put the frame back -- the panes have already been fitted to it by ratio,
+    # so this only undoes the window's own drift.
+    after = frame_key(await window.async_get_frame())
+    if after != before:
+        await window.async_set_frame(frame_from_key(before))
+        after = frame_key(await window.async_get_frame())
+        log("  restored frame")
+
+    # Record the frame this reflow left behind, so the next one can tell a
+    # window the user resized from the one the script is maintaining.
+    anchors[tab.tab_id] = ((after, len(panes)), total)
+    log("  used={} ({}) -> frame={}".format(total, why, after))
 
 
 def tab_containing(app, session_id):

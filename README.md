@@ -54,6 +54,15 @@ flat list, so a splitter with vertical dividers divides width among its children
 and one with horizontal dividers divides height. Boundaries are rounded instead
 of individual shares, so rounding error can't accumulate within a pass.
 
+Asking for the cells a tab already had does not reliably reproduce the window it
+had them in. Dividers, per-pane margins and a scrollbar all take room that
+counting pane cells can't see, and they cost different amounts in a tab with one
+pane than in a tab with four — so the first reflow on a tab would shrink the
+window by those few points. Rather than price each of them, the script reads the
+window frame before the reflow and puts it back afterwards. The panes have
+already been fitted to that frame by ratio, so restoring it only undoes the
+window's own drift.
+
 The total is *anchored* rather than re-measured on every pass, and that part is
 load-bearing. A cell is not a whole number of points wide, so a window sized to
 hold exactly N cells falls a fraction of a cell short and iTerm2 lays out N-1.
