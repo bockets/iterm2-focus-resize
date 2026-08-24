@@ -44,23 +44,27 @@ The script wires up the two pieces iTerm2 exposes:
 - Setting each session's `preferred_size` and calling `Tab.async_update_layout()`
   recomputes the tab's layout.
 
-`preferred_size` is a request measured in cells, and a tab whose panes ask for
-more room than the window has will make iTerm2 grow the *window* to fit. So each
-reflow starts by measuring how many cells the tab currently occupies, walking
-`Tab.root` to add up the split tree, and then divides exactly that many cells
-between the panes: the focused one gets `GROW` shares, each sibling gets one.
-Cells in equals cells out, so the window keeps whatever size you gave it, and a
-window you shrink by dragging its edge stays shrunk.
-
-Those measurements are read fresh on every focus change — the app model is
-refreshed first, so a window resized a moment ago reports its new grid sizes.
-Nothing about the previous layout is carried forward, which means there is no
-stale size to spring back to and no drift from switching back and forth.
+`preferred_size` is a request measured in cells, and iTerm2 sizes the *window*
+to fit what a tab's panes collectively ask for. A reflow therefore divides a
+fixed number of cells between the panes — the focused one gets `GROW` shares,
+each sibling gets one — so the window keeps whatever size you gave it.
 
 The division recurses through the split tree rather than treating the panes as a
 flat list, so a splitter with vertical dividers divides width among its children
 and one with horizontal dividers divides height. Boundaries are rounded instead
-of individual shares, so rounding error can't accumulate and change the total.
+of individual shares, so rounding error can't accumulate within a pass.
+
+The total is *anchored* rather than re-measured on every pass, and that part is
+load-bearing. A cell is not a whole number of points wide, so a window sized to
+hold exactly N cells falls a fraction of a cell short and iTerm2 lays out N-1.
+Measuring the panes again would feed that loss straight back in, walking the
+window one character narrower with every pane switch.
+
+A window you resize does need a fresh anchor, and the only way to tell your
+resize apart from the script's own one-cell settling is to remember the frame
+each reflow left behind. A frame that still matches is nobody's doing but the
+script's, so the anchor stands; any other frame means you moved an edge, so the
+tab is measured again. Splitting or closing a pane re-anchors too.
 
 Focus events arrive in bursts — cycling six panes with `Cmd-]` fires six of them
 — so a resize is scheduled `DEBOUNCE_SECONDS` out and cancelled by the next
