@@ -79,6 +79,27 @@ Focus events arrive in bursts — cycling six panes with `Cmd-]` fires six of th
 — so a resize is scheduled `DEBOUNCE_SECONDS` out and cancelled by the next
 event. Panes passed through mid-cycle never reflow at all.
 
+## Tests
+
+```sh
+python3 -m unittest discover -s tests
+```
+
+No dependencies — `tests/fake_iterm2.py` stands in for iTerm2. It models only
+behaviour observed from the real thing: fractional cells that each pane floors
+independently, dividers and margins that cost invisible points, panes fitted by
+the ratio of their requests, and a window that grows when a request won't fit.
+It deliberately does *not* model the window snapping to whole cells after every
+layout — a real session log showed the frame pinned across a dozen consecutive
+reflows, and a guessed engine is worse than none: it fails strategies that work
+in practice and passes ones that don't.
+
+The load-bearing test is that a reflow never asks for more cells than the tab
+holds. That was a real failure — over-requesting by a few cells made iTerm2
+decline the layout entirely, so the panes kept their sizes, no `SIGWINCH`
+reached the programs in them, and pane switching quietly stopped resizing
+anything.
+
 ## Logging
 
 Every reflow can log the window frame, the pane grids it measured, the total it

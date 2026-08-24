@@ -104,8 +104,11 @@ def weigh(node, focused_session_id):
 def divide(total, weights):
     """Split `total` into integers proportional to `weights`, summing to total.
 
-    Boundaries are rounded rather than the individual shares, so rounding error
-    cannot accumulate and change the total the tab asks for.
+    Summing to exactly `total` is the point: the reflow hands a tab the cells it
+    already had, and a division that invents or loses one asks iTerm2 for a
+    window it doesn't have. So boundaries are rounded rather than the individual
+    shares -- rounding error can't accumulate that way -- and the floor below
+    moves cells between panes rather than adding them.
     """
     scale = total / sum(weights)
     boundaries = []
@@ -117,16 +120,30 @@ def divide(total, weights):
     previous = 0
     shares = []
     for boundary in boundaries:
-        shares.append(max(MIN_CELLS, boundary - previous))
+        shares.append(boundary - previous)
         previous = boundary
+
+    # Lift anything under the floor by taking from the largest pane, so the
+    # total is untouched. A tab too small to give every pane the floor gets as
+    # close as it can: the floor is capped at an even split.
+    floor = min(MIN_CELLS, total // len(weights))
+    while min(shares) < floor:
+        smallest = shares.index(min(shares))
+        largest = shares.index(max(shares))
+        if shares[largest] - 1 < floor:
+            break
+        shares[smallest] += 1
+        shares[largest] -= 1
     return shares
 
 
 def assign(node, width, height, focused_session_id):
     """Hand `node` a width x height budget, recursing into splitters."""
     if not is_splitter(node):
+        # divide() already holds panes at the floor where the tab allows it;
+        # clamping here too would add cells the tab doesn't have.
         node.preferred_size = iterm2.util.Size(
-            max(MIN_CELLS, round(width)), max(MIN_CELLS, round(height)))
+            max(1, round(width)), max(1, round(height)))
         return
 
     weights = [weigh(child, focused_session_id) for child in node.children]
@@ -152,14 +169,16 @@ async def resize_around(window, tab, focused_session_id):
     assign(tab.root, width, height, focused_session_id)
     await tab.async_update_layout()
 
-    after = frame_key(await window.async_get_frame())
+    laid_out = frame_key(await window.async_get_frame())
+    after = laid_out
     if after != before:
         await window.async_set_frame(frame_from_key(before))
         after = frame_key(await window.async_get_frame())
 
-    log("  -> frame={} grids={}".format(
-        after, [(pane.grid_size.width, pane.grid_size.height)
-                for pane in tab.sessions]))
+    log("  laid_out={}{} -> frame={} grids={}".format(
+        laid_out, " RESTORED" if laid_out != before else "", after,
+        [(pane.grid_size.width, pane.grid_size.height)
+         for pane in tab.sessions]))
 
 
 def tab_containing(app, session_id):
