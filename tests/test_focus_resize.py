@@ -42,8 +42,17 @@ def column(*ids):
         False, [fake_iterm2.Session(i) for i in ids])
 
 
-def reflow(window, session_id):
-    asyncio.run(resize_around(window, window.tab, session_id))
+def reflow(window, session_id, capacities=None):
+    asyncio.run(resize_around(
+        window, window.tab, session_id,
+        capacities if capacities is not None else {}))
+
+
+def reflows(window, session_ids):
+    """Repeated reflows sharing the learned capacities, as the script does."""
+    capacities = {}
+    for session_id in session_ids:
+        reflow(window, session_id, capacities)
 
 
 def widths(window):
@@ -178,25 +187,65 @@ class ReflowTest(unittest.TestCase):
     def test_panes_move_on_every_switch(self):
         """Guards the production failure where panes stopped moving at all."""
         window = fake_iterm2.Window(row("a", "b", "c", "d"), 2000, 900)
-        reflow(window, "a")
+        capacities = {}
+        reflow(window, "a", capacities)
 
         for session_id in ["b", "c", "d", "a"] * 3:
-            reflow(window, session_id)
+            reflow(window, session_id, capacities)
             largest = widths(window).index(max(widths(window)))
 
             self.assertEqual(largest, ["a", "b", "c", "d"].index(session_id))
 
-    def test_the_window_is_never_grown(self):
-        """Growing the window is the one way a reflow is known to disturb it."""
+    def test_the_window_keeps_its_size_across_many_switches(self):
         for root in (row("a", "b", "c", "d"), column("a", "b", "c"),
                      fake_iterm2.Splitter(
                          True, [fake_iterm2.Session("a"), column("b", "c")])):
             window = fake_iterm2.Window(root, 2000, 900)
+            ids = [pane.session_id for pane in window.tab.sessions]
+            reflows(window, ids)
+            settled = (window.frame.size.width, window.frame.size.height)
 
-            for session_id in [pane.session_id for pane in window.tab.sessions] * 5:
-                reflow(window, session_id)
+            reflows(window, ids * 6)
 
-            self.assertFalse(window.grew)
+            self.assertEqual(
+                (window.frame.size.width, window.frame.size.height), settled)
+
+    def test_the_window_is_never_shrunk(self):
+        """Shrinking is what made the window creep smaller per pane switch."""
+        window = fake_iterm2.Window(row("a", "b", "c", "d"), 2000, 900)
+        capacities = {}
+        reflow(window, "a", capacities)
+        window.shrank = 0
+
+        for session_id in ["b", "c", "d", "a"] * 5:
+            reflow(window, session_id, capacities)
+
+        self.assertEqual(window.shrank, 0)
+
+    def test_a_resized_window_is_probed_again(self):
+        window = fake_iterm2.Window(row("a", "b", "c"), 2000, 900)
+        capacities = {}
+        reflow(window, "a", capacities)
+
+        window.frame.size = fake_iterm2.Size(1400, 900)
+        window.shrank = 0
+        for session_id in ["b", "c", "a"] * 4:
+            reflow(window, session_id, capacities)
+
+            self.assertEqual(window.shrank, 0, session_id)
+        self.assertLessEqual(window.frame.size.width, 1400)
+
+    def test_a_settled_tab_costs_no_declined_attempts(self):
+        """Capacity is found once per window size, not re-probed per switch."""
+        window = fake_iterm2.Window(row("a", "b", "c", "d"), 2000, 900)
+        capacities = {}
+        reflow(window, "a", capacities)
+        window.declined = 0
+
+        for session_id in ["b", "c", "d", "a"] * 5:
+            reflow(window, session_id, capacities)
+
+        self.assertEqual(window.declined, 0)
 
     def test_the_window_keeps_its_position(self):
         window = fake_iterm2.Window(row("a", "b"), 2000, 900, origin=(37, 91))
@@ -206,24 +255,6 @@ class ReflowTest(unittest.TestCase):
 
             self.assertEqual(
                 (window.frame.origin.x, window.frame.origin.y), (37, 91))
-
-    def test_a_window_that_moves_on_layout_is_put_back(self):
-        """A window that moved during a reflow gets its frame set back.
-
-        Only that the restore is attempted is asserted, not that it wins. If a
-        layout changes the window size, so does restoring it -- putting the
-        frame back re-fits the panes, which changes how many cells they occupy,
-        which moves the window again. Whether that converges is iTerm2's to
-        decide, and the real thing was never seen doing it at all.
-        """
-        window = fake_iterm2.Window(
-            row("a", "b", "c"), 2000, 900, snap_window=True)
-        reflow(window, "a")
-        calls = window.set_frame_calls
-
-        reflow(window, "b")
-
-        self.assertGreater(window.set_frame_calls, calls)
 
     def test_a_single_pane_tab_is_left_alone(self):
         only = fake_iterm2.Session("a")

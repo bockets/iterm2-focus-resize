@@ -5,20 +5,19 @@ a guessed layout engine is worse than none -- it fails strategies that work and
 passes ones that don't:
 
 * A cell is a fractional number of points, and each pane floors its own share
-  independently. So a tab holds a couple more cells when its panes are even than
-  when one of them is large, and the total moves as focus moves.
+  independently. So the cells a tab *occupies* is a little under what it can
+  *hold*, and the shortfall moves as focus moves.
 * Dividers and per-pane margins cost points that counting cells cannot see, and
   a four-pane tab spends more of them than a one-pane tab.
-* Panes are fitted to the window by the *ratio* of their requests, so the
-  absolute size of a request doesn't matter as long as it fits.
-* A request the window cannot hold makes the window grow to fit it. This is the
-  one way a reflow is known to change the window, and it's what the script is
-  written to avoid.
+* Panes are fitted to the window by the *ratio* of their requests.
+* Asking for fewer cells than the window holds shrinks the window to fit the
+  request -- a cell or more of slack is enough to move it.
+* Asking for more cells than the window holds makes iTerm2 decline the layout
+  outright: the panes keep the sizes they had and the window does not move.
 
 What is deliberately *not* modelled: the window snapping down to a whole number
 of cells after every layout. A real session log showed the window frame pinned
 across a dozen consecutive reflows, so iTerm2 does not do this on each pass.
-`snap_window=True` turns it on for the one test that covers the restore path.
 """
 
 import sys
@@ -111,16 +110,15 @@ class Splitter:
 class Window:
     """A window whose panes are re-laid-out whenever the layout is updated."""
 
-    def __init__(self, root, width, height, origin=(100, 200),
-                 snap_window=False):
+    def __init__(self, root, width, height, origin=(100, 200)):
         self.root = root
-        self.snap_window = snap_window
-        self.grew = False
+        self.declined = 0
+        self.shrank = 0
         self.frame = Frame(Point(*origin), Size(width, height))
         self.tab = Tab(self, root)
         self.tabs = [self.tab]
         self.set_frame_calls = 0
-        self._relayout()
+        self._even_layout()
 
     async def async_get_frame(self):
         return Frame(
@@ -158,20 +156,36 @@ class Window:
         parts = [self._requested_points(child, axis) for child in node.children]
         return sum(parts) if along else max(parts)
 
+    def _even_layout(self):
+        """The layout a fresh tab has: panes split evenly, window untouched."""
+        for axis, unit in (("w", CELL_WIDTH), ("h", CELL_HEIGHT)):
+            usable = self._span(axis) - self._decorations(self.root, axis)
+            for pane in self.root.sessions:
+                pane.preferred_size = Size(1, 1)
+            self._distribute(self.root, axis, usable, unit)
+        for pane in self.root.sessions:
+            pane.preferred_size = Size(
+                pane.grid_size.width, pane.grid_size.height)
+
     def _relayout(self):
-        """Fit panes to the window, growing the window if they don't fit."""
+        """Fit panes to the window, or decline if they don't fit."""
         for axis, unit in (("w", CELL_WIDTH), ("h", CELL_HEIGHT)):
             decorations = self._decorations(self.root, axis)
             usable = self._span(axis) - decorations
             wanted = self._requested_points(self.root, axis)
+
             if wanted > usable + 0.0001:
-                self.grew = True
+                # More than the window holds: iTerm2 leaves the layout alone.
+                self.declined += 1
+                continue
+
+            if wanted < usable - unit:
+                # A cell or more of slack: the window shrinks onto the request.
+                self.shrank += 1
                 self._set_span(axis, wanted + decorations)
                 usable = wanted
+
             self._distribute(self.root, axis, usable, unit)
-            if self.snap_window:
-                self._set_span(
-                    axis, self._occupied(self.root, axis) * unit + decorations)
 
     def _distribute(self, node, axis, points, unit):
         if not isinstance(node, Splitter):

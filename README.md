@@ -44,36 +44,41 @@ The script wires up the two pieces iTerm2 exposes:
 - Setting each session's `preferred_size` and calling `Tab.async_update_layout()`
   recomputes the tab's layout.
 
-`preferred_size` is a request measured in cells, and iTerm2 sizes the *window*
-to fit what a tab's panes collectively ask for. A reflow measures how many cells
-the tab holds right now and divides exactly those among the panes — the focused
-one gets `GROW` shares, each sibling gets one.
+`preferred_size` is a request measured in cells, and iTerm2 answers one of three
+ways:
 
-The division recurses through the split tree rather than treating the panes as a
-flat list, so a splitter with vertical dividers divides width among its children
-and one with horizontal dividers divides height. Boundaries are rounded instead
-of individual shares, so rounding error can't accumulate within a pass.
+| Request | What happens |
+| --- | --- |
+| Exactly what the tab holds | Panes are re-fitted, window untouched — the goal |
+| Less | The window shrinks onto the request |
+| More | The layout is declined outright: panes keep their sizes, no `SIGWINCH` reaches the programs in them, nothing visibly happens |
 
-Two things stop that from being plain arithmetic.
+So a reflow needs the number of cells the tab can *hold*, and that number can't
+be measured. Adding up the panes gives what they *occupy*, which is slightly
+less — each pane floors its own fractional share — and the shortfall changes as
+focus moves. Requesting the measured total is what makes the window creep a
+character smaller on every pane switch.
 
-**A tab doesn't hold a fixed number of cells.** Each pane floors its own
-fractional width, so the same window holds a couple more cells when the panes
-are even than when one of them is large — the total genuinely moves as focus
-moves. This is why the total is measured on every reflow instead of being
-remembered. A remembered total is a few cells too large for some distributions,
-and a request iTerm2 can't satisfy is one it declines outright: the panes keep
-the layout they had, no `SIGWINCH` reaches the programs inside them, and the
-resize silently does nothing at all. Measuring fresh keeps every request
-achievable.
+Capacity is therefore probed for, which works because a declined request is
+free: it changes nothing, on screen or in the child processes. The first reflow
+on a tab asks for a pane-count more cells than the panes occupy — the most their
+floored remainders can be hiding — and steps down until iTerm2 accepts, which it
+happens at exactly capacity. The answer belongs to the window, so it's reused
+until the window's frame changes and every later reflow lands first time. In
+practice that's a handful of declined attempts the first time a tab is focused
+and none after, with the window never asked to grow or shrink.
 
-**Asking for the cells a tab had doesn't reproduce the window it had them in.**
-Dividers, per-pane margins and a scrollbar all take room that counting pane
-cells can't see, and they cost different amounts in a tab with one pane than in
-a tab with four, so the window drifts slightly smaller. The script reads the
-window frame before the reflow and puts it back afterwards. The panes have
-already been fitted to that frame by ratio, so restoring it undoes only the
-window's own drift — and that's what keeps measuring-every-time from walking the
-window narrower one pane switch at a time.
+Acceptance is judged per axis, because an accepted layout spends every cell it
+asked for and iTerm2 answers width and height separately. Checking them together
+lets a landed width mask a height that's still too big, which leaves that axis
+permanently wrong and re-declining on every switch.
+
+The division itself recurses through the split tree rather than treating the
+panes as a flat list, so a splitter with vertical dividers divides width among
+its children and one with horizontal dividers divides height. Boundaries are
+rounded instead of individual shares, and the `MIN_CELLS` floor moves cells
+between panes rather than adding them, so a division always sums to exactly what
+was asked for.
 
 Focus events arrive in bursts — cycling six panes with `Cmd-]` fires six of them
 — so a resize is scheduled `DEBOUNCE_SECONDS` out and cancelled by the next
@@ -94,11 +99,12 @@ layout — a real session log showed the frame pinned across a dozen consecutive
 reflows, and a guessed engine is worse than none: it fails strategies that work
 in practice and passes ones that don't.
 
-The load-bearing test is that a reflow never asks for more cells than the tab
-holds. That was a real failure — over-requesting by a few cells made iTerm2
-decline the layout entirely, so the panes kept their sizes, no `SIGWINCH`
-reached the programs in them, and pane switching quietly stopped resizing
-anything.
+The load-bearing tests are that the window is never grown or shrunk across many
+switches, that the panes move every time, and that a settled tab costs no
+declined attempts. Each of those is a bug that shipped: a window creeping
+smaller per switch, panes silently freezing when a request was a few cells too
+big, and a shrink-then-recover flicker on every pane change from an earlier fix
+that put the window frame back by hand.
 
 ## Logging
 

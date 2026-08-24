@@ -5,28 +5,25 @@ iTerm2 has no built-in focus-driven resize, but it exposes both halves of the
 wiring: FocusMonitor reports active-session changes, and a tab's layout can be
 recomputed from each session's preferred_size.
 
-preferred_size is a request measured in cells, and iTerm2 sizes the *window* to
-fit what a tab's panes collectively ask for. So a reflow measures how many cells
-the tab holds right now and divides exactly those between the panes: the focused
-one gets GROW shares, each sibling gets one.
+preferred_size is a request measured in cells, and iTerm2 answers one of three
+ways. Ask for what the tab holds and the panes are re-fitted with the window
+left alone -- the goal. Ask for less and the window shrinks onto the request.
+Ask for more and the layout is declined outright: the panes keep their sizes, no
+SIGWINCH reaches the programs inside them, and nothing visibly happens.
 
-Two things make that not quite arithmetic. Asking for the cells a tab already
-had does not reproduce the window it had them in -- dividers, pane margins and a
-scrollbar all cost room that counting cells cannot see -- so the window drifts a
-little smaller. And a tab does not hold a fixed number of cells: a pane floors
-its own fractional width, so the same window holds a couple more cells when the
-panes are even than when one is large.
+So the reflow needs the number of cells the tab can hold, and that number cannot
+be measured. Each pane floors its own fractional share, so adding up the panes
+gives a total slightly under capacity, and the shortfall changes as focus moves.
+Requesting that measured total is what makes the window creep smaller.
 
-The second one is why the total is measured every time rather than remembered.
-A remembered total is a few cells too large for some distributions, and a
-request iTerm2 cannot satisfy is one it declines entirely: the panes then keep
-the layout they had, no SIGWINCH reaches the programs in them, and the resize
-silently does nothing. Measuring fresh keeps every request achievable.
-
-The first one is handled by putting the window frame back after the reflow. The
-panes have already been fitted to that frame by ratio, so restoring it undoes
-only the window's own drift -- which is what stops a measure-every-time reflow
-from walking the window narrower one pane switch at a time.
+Capacity is therefore probed for rather than measured, which works because a
+declined request is free: it changes nothing, on screen or in the child
+processes. The first reflow on a tab asks for a pane-count more cells than the
+panes occupy -- the most their floored remainders can be hiding -- and steps
+down until iTerm2 accepts, which it does at exactly capacity. The answer belongs
+to the window, so it is reused until the window's frame changes, and every later
+reflow lands first time. The window is never asked to grow and never asked to
+shrink, so it doesn't move at all.
 """
 
 import asyncio
@@ -48,6 +45,11 @@ GROW = 1.8
 # Never hand a pane fewer cells than this, however lopsided the weights get.
 MIN_CELLS = 4
 
+# Cap on probe attempts per axis. Each pane can hide up to one cell of floored
+# remainder, so capacity is within a pane-count of the measured total; the extra
+# attempts are slack for a window resized between reflows.
+MAX_ATTEMPTS = 8
+
 # Reflows are logged here, but only if the file already exists -- `touch` it to
 # turn logging on, delete it to turn logging off. No restart either way.
 LOG_PATH = os.path.expanduser("~/Library/Logs/focus_resize.log")
@@ -64,12 +66,6 @@ def log(message):
 def frame_key(frame):
     """A window frame reduced to something comparable across reflows."""
     return (frame.origin.x, frame.origin.y, frame.size.width, frame.size.height)
-
-
-def frame_from_key(key):
-    x, y, width, height = key
-    return iterm2.util.Frame(
-        iterm2.util.Point(x, y), iterm2.util.Size(width, height))
 
 
 def is_splitter(node):
@@ -155,30 +151,52 @@ def assign(node, width, height, focused_session_id):
             assign(child, width, share, focused_session_id)
 
 
-async def resize_around(window, tab, focused_session_id):
+async def resize_around(window, tab, focused_session_id, capacities):
     panes = tab.sessions
     if len(panes) < 2:
         return
 
-    before = frame_key(await window.async_get_frame())
-    width, height = measure(tab.root)
-    log("tab={} panes={} frame={} measured={} grids={}".format(
-        tab.tab_id[-4:], len(panes), before, (width, height),
-        [(pane.grid_size.width, pane.grid_size.height) for pane in panes]))
+    frame = frame_key(await window.async_get_frame())
+    occupied = measure(tab.root)
 
-    assign(tab.root, width, height, focused_session_id)
-    await tab.async_update_layout()
+    # Capacity belongs to the window, so an answer found at this frame still
+    # holds and is reused as-is -- re-probing every switch would spend a
+    # declined round trip on a number that hasn't changed. With no answer to go
+    # on, start a pane-count above what the panes occupy, which is the most
+    # their floored remainders can be hiding, and step down to the truth.
+    remembered = capacities.get(tab.tab_id)
+    if remembered is not None and remembered[0] == frame:
+        target = list(remembered[1])
+    else:
+        target = [value + len(panes) for value in occupied]
 
-    laid_out = frame_key(await window.async_get_frame())
-    after = laid_out
-    if after != before:
-        await window.async_set_frame(frame_from_key(before))
-        after = frame_key(await window.async_get_frame())
+    log("tab={} panes={} frame={} occupied={} from={}".format(
+        tab.tab_id[-4:], len(panes), frame, occupied, target))
 
-    log("  laid_out={}{} -> frame={} grids={}".format(
-        laid_out, " RESTORED" if laid_out != before else "", after,
-        [(pane.grid_size.width, pane.grid_size.height)
-         for pane in tab.sessions]))
+    for attempt in range(MAX_ATTEMPTS):
+        assign(tab.root, target[0], target[1], focused_session_id)
+        await tab.async_update_layout()
+
+        # An accepted layout spends every cell it asked for. Coming up short
+        # means iTerm2 declined that axis and left it as it was -- and the axes
+        # are answered separately, so width can land while height is still too
+        # big. Checking them together would leave the loser permanently wrong.
+        settled = measure(tab.root)
+        if settled == tuple(target):
+            capacities[tab.tab_id] = (
+                frame_key(await window.async_get_frame()), list(target))
+            log("  accepted {} after {} attempt(s)".format(
+                target, attempt + 1))
+            return
+
+        stepped = [max(floor, value - 1) if value != reached else value
+                   for value, reached, floor
+                   in zip(target, settled, occupied)]
+        if stepped == target:
+            break
+        target = stepped
+
+    log("  gave up at {}, occupying {}".format(target, measure(tab.root)))
 
 
 def tab_containing(app, session_id):
@@ -190,7 +208,7 @@ def tab_containing(app, session_id):
     return None, None
 
 
-async def resize_after_settling(app, session_id):
+async def resize_after_settling(app, session_id, capacities):
     """Resize once focus has stopped moving.
 
     Cancelled by the next focus change, so panes passed through mid-cycle never
@@ -204,13 +222,15 @@ async def resize_after_settling(app, session_id):
 
     window, tab = tab_containing(app, session_id)
     if tab is not None:
-        await resize_around(window, tab, session_id)
+        await resize_around(window, tab, session_id, capacities)
 
 
 async def main(connection):
     app = await iterm2.async_get_app(connection)
     last_session_id = None
     pending = None
+    # tab id -> (window frame, [width, height] capacity in cells)
+    capacities = {}
 
     async with iterm2.FocusMonitor(connection) as monitor:
         while True:
@@ -230,7 +250,7 @@ async def main(connection):
 
             if pending is not None:
                 pending.cancel()
-            pending = asyncio.create_task(resize_after_settling(app, session_id))
+            pending = asyncio.create_task(resize_after_settling(app, session_id, capacities))
 
 
 iterm2.run_forever(main)
