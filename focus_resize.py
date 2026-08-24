@@ -24,6 +24,8 @@ pane re-anchors too.
 """
 
 import asyncio
+import datetime
+import os
 
 import iterm2
 
@@ -39,6 +41,18 @@ GROW = 1.8
 
 # Never hand a pane fewer cells than this, however lopsided the weights get.
 MIN_CELLS = 4
+
+# Reflows are logged here, but only if the file already exists -- `touch` it to
+# turn logging on, delete it to turn logging off. No restart either way.
+LOG_PATH = os.path.expanduser("~/Library/Logs/focus_resize.log")
+
+
+def log(message):
+    if not os.path.exists(LOG_PATH):
+        return
+    stamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    with open(LOG_PATH, "a") as handle:
+        handle.write("{} {}\n".format(stamp, message))
 
 
 def frame_key(frame):
@@ -114,13 +128,24 @@ def assign(node, width, height, focused_session_id):
 
 async def resize_around(window, tab, focused_session_id, anchors):
     panes = tab.sessions
+    before = frame_key(await window.async_get_frame())
+    measured = measure(tab.root)
+    log("tab={} panes={} frame={} measured={} grids={}".format(
+        tab.tab_id[-4:], len(panes), before, measured,
+        [(s.grid_size.width, s.grid_size.height) for s in panes]))
+
     if len(panes) < 2:
         return
 
     # The layout the last reflow left behind, if this is still that layout.
-    signature = (frame_key(await window.async_get_frame()), len(panes))
+    signature = (before, len(panes))
     anchored = anchors.get(tab.tab_id)
-    total = anchored[1] if anchored and anchored[0] == signature else measure(tab.root)
+    if anchored is None:
+        total, why = measured, "first sight"
+    elif anchored[0] != signature:
+        total, why = measured, "re-anchor, was {}".format(anchored[0])
+    else:
+        total, why = anchored[1], "anchored"
 
     assign(tab.root, total[0], total[1], focused_session_id)
     await tab.async_update_layout()
@@ -129,6 +154,7 @@ async def resize_around(window, tab, focused_session_id, anchors):
     # the user resized from a window iTerm2 rounded down to fit the request.
     settled = (frame_key(await window.async_get_frame()), len(panes))
     anchors[tab.tab_id] = (settled, total)
+    log("  used={} ({}) -> frame={}".format(total, why, settled[0]))
 
 
 def tab_containing(app, session_id):

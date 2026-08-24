@@ -70,6 +70,20 @@ Focus events arrive in bursts — cycling six panes with `Cmd-]` fires six of th
 — so a resize is scheduled `DEBOUNCE_SECONDS` out and cancelled by the next
 event. Panes passed through mid-cycle never reflow at all.
 
+## Logging
+
+Every reflow can log the window frame, the pane grids it measured, the total it
+used and why, and the frame that resulted. It writes to
+`~/Library/Logs/focus_resize.log`, but only when that file already exists:
+
+```sh
+touch ~/Library/Logs/focus_resize.log   # on
+rm ~/Library/Logs/focus_resize.log      # off
+```
+
+Neither needs a restart, and with the file absent the check is one `stat` per
+pane switch.
+
 ## Known limitations
 
 - **Pane size, not font size.** Panes get more cells; the font stays put.
