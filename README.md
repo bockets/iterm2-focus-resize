@@ -45,35 +45,35 @@ The script wires up the two pieces iTerm2 exposes:
   recomputes the tab's layout.
 
 `preferred_size` is a request measured in cells, and iTerm2 sizes the *window*
-to fit what a tab's panes collectively ask for. A reflow therefore divides a
-fixed number of cells between the panes — the focused one gets `GROW` shares,
-each sibling gets one — so the window keeps whatever size you gave it.
+to fit what a tab's panes collectively ask for. A reflow measures how many cells
+the tab holds right now and divides exactly those among the panes — the focused
+one gets `GROW` shares, each sibling gets one.
 
 The division recurses through the split tree rather than treating the panes as a
 flat list, so a splitter with vertical dividers divides width among its children
 and one with horizontal dividers divides height. Boundaries are rounded instead
 of individual shares, so rounding error can't accumulate within a pass.
 
-Asking for the cells a tab already had does not reliably reproduce the window it
-had them in. Dividers, per-pane margins and a scrollbar all take room that
-counting pane cells can't see, and they cost different amounts in a tab with one
-pane than in a tab with four — so the first reflow on a tab would shrink the
-window by those few points. Rather than price each of them, the script reads the
+Two things stop that from being plain arithmetic.
+
+**A tab doesn't hold a fixed number of cells.** Each pane floors its own
+fractional width, so the same window holds a couple more cells when the panes
+are even than when one of them is large — the total genuinely moves as focus
+moves. This is why the total is measured on every reflow instead of being
+remembered. A remembered total is a few cells too large for some distributions,
+and a request iTerm2 can't satisfy is one it declines outright: the panes keep
+the layout they had, no `SIGWINCH` reaches the programs inside them, and the
+resize silently does nothing at all. Measuring fresh keeps every request
+achievable.
+
+**Asking for the cells a tab had doesn't reproduce the window it had them in.**
+Dividers, per-pane margins and a scrollbar all take room that counting pane
+cells can't see, and they cost different amounts in a tab with one pane than in
+a tab with four, so the window drifts slightly smaller. The script reads the
 window frame before the reflow and puts it back afterwards. The panes have
-already been fitted to that frame by ratio, so restoring it only undoes the
-window's own drift.
-
-The total is *anchored* rather than re-measured on every pass, and that part is
-load-bearing. A cell is not a whole number of points wide, so a window sized to
-hold exactly N cells falls a fraction of a cell short and iTerm2 lays out N-1.
-Measuring the panes again would feed that loss straight back in, walking the
-window one character narrower with every pane switch.
-
-A window you resize does need a fresh anchor, and the only way to tell your
-resize apart from the script's own one-cell settling is to remember the frame
-each reflow left behind. A frame that still matches is nobody's doing but the
-script's, so the anchor stands; any other frame means you moved an edge, so the
-tab is measured again. Splitting or closing a pane re-anchors too.
+already been fitted to that frame by ratio, so restoring it undoes only the
+window's own drift — and that's what keeps measuring-every-time from walking the
+window narrower one pane switch at a time.
 
 Focus events arrive in bursts — cycling six panes with `Cmd-]` fires six of them
 — so a resize is scheduled `DEBOUNCE_SECONDS` out and cancelled by the next

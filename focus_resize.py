@@ -6,21 +6,27 @@ wiring: FocusMonitor reports active-session changes, and a tab's layout can be
 recomputed from each session's preferred_size.
 
 preferred_size is a request measured in cells, and iTerm2 sizes the *window* to
-fit what a tab's panes collectively ask for. So a reflow divides a fixed number
-of cells between the panes -- the focused one gets GROW shares, each sibling
-gets one -- and the window keeps whatever size the user gave it.
+fit what a tab's panes collectively ask for. So a reflow measures how many cells
+the tab holds right now and divides exactly those between the panes: the focused
+one gets GROW shares, each sibling gets one.
 
-That total cannot be re-measured from the panes on every pass. A cell is not a
-whole number of points wide, so a window sized to hold exactly N cells is a
-fraction of a cell short of N and iTerm2 lays out N-1; measuring again would
-feed that loss back in and walk the window a character narrower on every pane
-switch. The total is therefore measured once and reused (the "anchor" below).
+Two things make that not quite arithmetic. Asking for the cells a tab already
+had does not reproduce the window it had them in -- dividers, pane margins and a
+scrollbar all cost room that counting cells cannot see -- so the window drifts a
+little smaller. And a tab does not hold a fixed number of cells: a pane floors
+its own fractional width, so the same window holds a couple more cells when the
+panes are even than when one is large.
 
-A window the user resizes does need a new anchor, and the only way to tell that
-resize apart from the script's own one-cell settling is to remember the frame
-each reflow left behind: a frame that still matches is nobody's doing but ours,
-while any other frame means the user dragged an edge. Splitting or closing a
-pane re-anchors too.
+The second one is why the total is measured every time rather than remembered.
+A remembered total is a few cells too large for some distributions, and a
+request iTerm2 cannot satisfy is one it declines entirely: the panes then keep
+the layout they had, no SIGWINCH reaches the programs in them, and the resize
+silently does nothing. Measuring fresh keeps every request achievable.
+
+The first one is handled by putting the window frame back after the reflow. The
+panes have already been fitted to that frame by ratio, so restoring it undoes
+only the window's own drift -- which is what stops a measure-every-time reflow
+from walking the window narrower one pane switch at a time.
 """
 
 import asyncio
@@ -132,46 +138,28 @@ def assign(node, width, height, focused_session_id):
             assign(child, width, share, focused_session_id)
 
 
-async def resize_around(window, tab, focused_session_id, anchors):
+async def resize_around(window, tab, focused_session_id):
     panes = tab.sessions
-    before = frame_key(await window.async_get_frame())
-    measured = measure(tab.root)
-    log("tab={} panes={} frame={} measured={} grids={}".format(
-        tab.tab_id[-4:], len(panes), before, measured,
-        [(s.grid_size.width, s.grid_size.height) for s in panes]))
-
     if len(panes) < 2:
         return
 
-    # The layout the last reflow left behind, if this is still that layout.
-    signature = (before, len(panes))
-    anchored = anchors.get(tab.tab_id)
-    if anchored is None:
-        total, why = measured, "first sight"
-    elif anchored[0] != signature:
-        total, why = measured, "re-anchor, was {}".format(anchored[0])
-    else:
-        total, why = anchored[1], "anchored"
+    before = frame_key(await window.async_get_frame())
+    width, height = measure(tab.root)
+    log("tab={} panes={} frame={} measured={} grids={}".format(
+        tab.tab_id[-4:], len(panes), before, (width, height),
+        [(pane.grid_size.width, pane.grid_size.height) for pane in panes]))
 
-    assign(tab.root, total[0], total[1], focused_session_id)
+    assign(tab.root, width, height, focused_session_id)
     await tab.async_update_layout()
 
-    # Asking for the cells a tab already had does not reliably reproduce the
-    # window it had them in: dividers, per-pane margins and a scrollbar all take
-    # room that measuring the panes cannot see, and they differ between a tab
-    # with one pane and a tab with four. Rather than try to price each of them,
-    # put the frame back -- the panes have already been fitted to it by ratio,
-    # so this only undoes the window's own drift.
     after = frame_key(await window.async_get_frame())
     if after != before:
         await window.async_set_frame(frame_from_key(before))
         after = frame_key(await window.async_get_frame())
-        log("  restored frame")
 
-    # Record the frame this reflow left behind, so the next one can tell a
-    # window the user resized from the one the script is maintaining.
-    anchors[tab.tab_id] = ((after, len(panes)), total)
-    log("  used={} ({}) -> frame={}".format(total, why, after))
+    log("  -> frame={} grids={}".format(
+        after, [(pane.grid_size.width, pane.grid_size.height)
+                for pane in tab.sessions]))
 
 
 def tab_containing(app, session_id):
@@ -183,13 +171,7 @@ def tab_containing(app, session_id):
     return None, None
 
 
-def forget_closed_tabs(app, anchors):
-    live = {tab.tab_id for window in app.terminal_windows for tab in window.tabs}
-    for tab_id in set(anchors) - live:
-        del anchors[tab_id]
-
-
-async def resize_after_settling(app, session_id, anchors):
+async def resize_after_settling(app, session_id):
     """Resize once focus has stopped moving.
 
     Cancelled by the next focus change, so panes passed through mid-cycle never
@@ -200,19 +182,16 @@ async def resize_after_settling(app, session_id, anchors):
     # Re-read the layout so the split tree and window frame below are current,
     # including any resize the user just made by dragging an edge.
     await app.async_refresh()
-    forget_closed_tabs(app, anchors)
 
     window, tab = tab_containing(app, session_id)
     if tab is not None:
-        await resize_around(window, tab, session_id, anchors)
+        await resize_around(window, tab, session_id)
 
 
 async def main(connection):
     app = await iterm2.async_get_app(connection)
     last_session_id = None
     pending = None
-    # tab id -> ((window frame, pane count), (width, height) in cells)
-    anchors = {}
 
     async with iterm2.FocusMonitor(connection) as monitor:
         while True:
@@ -232,7 +211,7 @@ async def main(connection):
 
             if pending is not None:
                 pending.cancel()
-            pending = asyncio.create_task(resize_after_settling(app, session_id, anchors))
+            pending = asyncio.create_task(resize_after_settling(app, session_id))
 
 
 iterm2.run_forever(main)
